@@ -10,6 +10,8 @@ Abre TIDAL en Chrome (ventanas privadas / incógnito) en fases rápidas:
 8) opcional: invita al plan Familiar a los miembros de invitar_miembros.txt
    (misma línea que emails/LINKS). Si un titular se repite en emails.txt, esa única
    ventana invita a todos los miembros alineados con esas líneas.
+   Si el correo ya figura en Familia como «Activa» o «Activación pendiente», no se
+   reenvía. Al terminar se imprime un resumen de enviados, ya invitados y detalles.
 
 El trabajo se hace por oleadas de como máximo 5 ventanas simultáneas. Cada 2 oleadas
 se recicla Surfshark a un país LATAM (Perú, Bolivia, Chile, Brasil, Ecuador, Colombia,
@@ -161,13 +163,15 @@ def reciclar_vpn_latam_si_lote_grande(trabajos: list[dict], momento: str) -> Non
 
 @dataclass
 class CaptchaTidManejoCfg:
-    """Configuración para manejo manual de antibot TIDAL o 403 CloudFront (pausa manual para intervención)."""
+    """Configuración para manejo de antibot TIDAL o 403 CloudFront."""
 
     usar_surfshark: bool = False  # Desactivado - ahora es manual
     surfshark_exe: Path | None = None
     surfshark_espera_desconectar_rapida_s: float = 4.0
     espera_tras_surfshark_s: float = 7.0
     surfshark_timeout_botones_s: float = 15.0
+    # Pipeline: ante «Algo salió mal» rota Surfshark y sigue, sin Enter.
+    on_algo_mal: object = None
 
 
 def _normalizar_pausa_manual(modo: str) -> str:
@@ -868,7 +872,24 @@ def _es_pagina_login(page) -> bool:
             return True
         if "login" in url and "tidal.com" in url:
             return True
+        if "authorize" in url and "tidal.com" in url:
+            return True
         return False
+    except PWErr:
+        return False
+    except Exception:
+        return False
+
+
+def _esta_en_pagina_familia(page) -> bool:
+    """True solo si la pestaña está en account.tidal.com/family (sesión del titular)."""
+    from playwright.sync_api import Error as PWErr
+    try:
+        if page.is_closed():
+            return False
+        if _es_pagina_login(page):
+            return False
+        return "account.tidal.com/family" in (page.url or "").lower()
     except PWErr:
         return False
     except Exception:
@@ -1220,13 +1241,14 @@ def manejar_captcha_tid_si_aplica(
     pausa_dom_s: float,
     cfg: CaptchaTidManejoCfg,
 ) -> None:
-    """Detecta antibot/403 CloudFront y pausa para intervención manual (sin Surfshark automático)."""
+    """Antibot/403: pausa manual. «Algo salió mal» en el pipeline: rota Surfshark y sigue."""
     if pausa_dom_s > 0:
         time.sleep(pausa_dom_s)
         
     # Intentar resolver automáticamente cualquier slider antes de pausar
     intentar_autoresolver_sliders(trabajos)
-        
+
+    rotaciones_algo_mal = 0
     while True:
         afectadas = _ventanas_tid_requieren_surfshark(trabajos)
         if not afectadas:
@@ -1249,15 +1271,35 @@ def manejar_captcha_tid_si_aplica(
         print(f"\n{bar}\n  {titulo}\n{bar}")
         for n, perfil, motivo in afectadas:
             print(f"   • Ventana [{n}] — {perfil} ({motivo})")
-        
-        print(f"\n  ⚠️ [IP BLOQUEADA] SE REQUIERE ROTAR DE IP (VPN / PROXY / ROUTER).")
-        print(f"  ACCIÓN REQUERIDA:")
-        print(f"  1. Rota de IP ahora mismo ( VPN, reconectar router, etc. ).")
-        print(f"  2. Resuelve captchas si es que aparecen en las ventanas.")
-        print(f"  3. Pulsa Enter AQUÍ. El script mandará las ventanas afectadas a https://tidal.com/pricing para reiniciar.")
-        print(f"\n  El script esperará hasta que pulses Enter para continuar...")
-        
-        pausa_manual_forzada(f"Resolución manual de {titulo_base}")
+
+        rotar_solo = (
+            "error login TIDAL" in motivos
+            and callable(getattr(cfg, "on_algo_mal", None))
+        )
+        if rotar_solo:
+            rotaciones_algo_mal += 1
+            if rotaciones_algo_mal > 3:
+                print(
+                    "  [VPN] 'Algo salió mal' sigue tras 3 cambios de país. "
+                    "Se continúa sin pausa manual."
+                )
+                break
+            print(
+                "  [VPN] 'Algo salió mal': se rota Surfshark a otro país "
+                "y se reinicia el login desde pricing (sin Enter)."
+            )
+            try:
+                cfg.on_algo_mal(f"paso 5 · {momento or 'algo salió mal'}")
+            except Exception as exc:
+                print(f"  [VPN] No se pudo rotar la IP: {exc}")
+        else:
+            print(f"\n  ⚠️ [IP BLOQUEADA] SE REQUIERE ROTAR DE IP (VPN / PROXY / ROUTER).")
+            print(f"  ACCIÓN REQUERIDA:")
+            print(f"  1. Rota de IP ahora mismo ( VPN, reconectar router, etc. ).")
+            print(f"  2. Resuelve captchas si es que aparecen en las ventanas.")
+            print(f"  3. Pulsa Enter AQUÍ. El script mandará las ventanas afectadas a https://tidal.com/pricing para reiniciar.")
+            print(f"\n  El script esperará hasta que pulses Enter para continuar...")
+            pausa_manual_forzada(f"Resolución manual de {titulo_base}")
         
         # Guardar las afectadas antes de redireccionarlas
         afectadas_antes = list(afectadas)
@@ -1441,6 +1483,189 @@ def cargar_sesiones(
 
 def _clave_correo_titular(email: str) -> str:
     return (email or "").strip().casefold()
+
+
+_RX_EMAIL_FAMILIA = re.compile(
+    r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$",
+    re.I,
+)
+_RX_ESTADO_YA_INVITADO = re.compile(
+    r"activaci[oó]n\s+pendiente|activation\s+pending"
+    r"|(?<![A-Za-z])activa(?![A-Za-z])|(?<![A-Za-z])active(?![A-Za-z])",
+    re.I,
+)
+
+
+def _claves_correo_equivalentes(email: str) -> set[str]:
+    """Claves para comparar correos (minúsculas; en Gmail se ignoran los puntos)."""
+    e = (email or "").strip().casefold()
+    if not e or "@" not in e:
+        return {e} if e else set()
+    local, _, domain = e.partition("@")
+    keys = {e}
+    if domain in ("gmail.com", "googlemail.com"):
+        keys.add(local.replace(".", "") + "@gmail.com")
+        keys.add(local.split("+", 1)[0].replace(".", "") + "@gmail.com")
+    return keys
+
+
+def _correos_equivalentes(a: str, b: str) -> bool:
+    return bool(_claves_correo_equivalentes(a) & _claves_correo_equivalentes(b))
+
+
+def _correos_mismo_tidal(a: str, b: str) -> bool:
+    """Mismo correo para Tidal. Los puntos de Gmail son cuentas distintas."""
+    return (a or "").strip().casefold() == (b or "").strip().casefold()
+
+
+def parsear_miembros_familia_desde_texto(texto: str) -> list[tuple[str, str]]:
+    """Extrae pares (correo, estado) de la página Familia (Activa / Activación pendiente)."""
+    if not texto:
+        return []
+    lineas = [ln.strip() for ln in str(texto).replace("\r", "\n").split("\n")]
+    out: list[tuple[str, str]] = []
+    vistos: set[str] = set()
+    for i, ln in enumerate(lineas):
+        m_linea = _RX_EMAIL_FAMILIA.fullmatch(ln)
+        if m_linea:
+            email = m_linea.group(0)
+            estado = ""
+            for j in range(i + 1, min(i + 5, len(lineas))):
+                cand = lineas[j]
+                if not cand:
+                    continue
+                if _RX_EMAIL_FAMILIA.fullmatch(cand):
+                    break
+                em = _RX_ESTADO_YA_INVITADO.search(cand)
+                if em:
+                    estado = em.group(0).strip()
+                    break
+            if estado:
+                clave = email.casefold()
+                if clave not in vistos:
+                    vistos.add(clave)
+                    out.append((email, estado))
+            continue
+        m_inline = re.search(
+            r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", ln, re.I
+        )
+        if not m_inline:
+            continue
+        em = _RX_ESTADO_YA_INVITADO.search(ln)
+        if not em:
+            continue
+        email = m_inline.group(1)
+        clave = email.casefold()
+        if clave not in vistos:
+            vistos.add(clave)
+            out.append((email, em.group(0).strip()))
+    return out
+
+
+def _texto_pagina_familia(page) -> str:
+    partes: list[str] = []
+    try:
+        if page.is_closed():
+            return ""
+    except Exception:
+        return ""
+    for frame in _frames_visibles(page):
+        try:
+            t = frame.locator("body").inner_text(timeout=2500)
+            if t and t.strip():
+                partes.append(t)
+        except Exception:
+            continue
+    return "\n".join(partes)
+
+
+def listar_miembros_familia_en_pagina(page) -> list[tuple[str, str]]:
+    """Miembros visibles en account.tidal.com/family: [(email, estado), ...]."""
+    return parsear_miembros_familia_desde_texto(_texto_pagina_familia(page))
+
+
+def estado_invitacion_previa(page, email_objetivo: str) -> str | None:
+    """
+    Si el correo ya figura en el plan con Activa o Activación pendiente, devuelve ese estado.
+    """
+    email_objetivo = (email_objetivo or "").strip()
+    if not email_objetivo:
+        return None
+    for email, estado in listar_miembros_familia_en_pagina(page):
+        if _correos_mismo_tidal(email, email_objetivo):
+            return estado
+    return None
+
+
+def _texto_ventana_uia(wnd) -> str:
+    partes: list[str] = []
+    try:
+        t = (wnd.window_text() or "").strip()
+        if t:
+            partes.append(t)
+    except Exception:
+        pass
+    try:
+        for d in wnd.descendants():
+            try:
+                n = (d.element_info.name or "").strip()
+                if n:
+                    partes.append(n)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "\n".join(partes)
+
+
+def estado_invitacion_previa_uia(wnd, email_objetivo: str) -> str | None:
+    email_objetivo = (email_objetivo or "").strip()
+    if not email_objetivo:
+        return None
+    for email, estado in parsear_miembros_familia_desde_texto(_texto_ventana_uia(wnd)):
+        if _correos_mismo_tidal(email, email_objetivo):
+            return estado
+    return None
+
+
+def _anotar_unico(lista: list, valor: str) -> None:
+    if valor and valor not in lista:
+        lista.append(valor)
+
+
+def imprimir_resumen_invitaciones(resumen: dict) -> None:
+    """Monitoreo final en consola: enviados, ya invitados y detalles."""
+    ok = list(resumen.get("invitados_ok") or [])
+    ya = list(resumen.get("ya_invitados") or [])
+    err = list(resumen.get("errores") or [])
+    pwd = list(resumen.get("pwd_incorrecta") or [])
+    bar = "=" * 62
+    print(f"\n{bar}")
+    print("  RESUMEN FINAL DE INVITACIONES")
+    print(bar)
+    print(f"  Enviadas correctamente: {len(ok)}")
+    for e in ok:
+        print(f"    OK   {e}")
+    if not ok:
+        print("    (ninguna)")
+    print(f"  Ya estaban en el plan (Activa / Activacion pendiente): {len(ya)}")
+    for e in ya:
+        print(f"    YA   {e}")
+    if not ya:
+        print("    (ninguno)")
+    print(f"  Con detalle / no completadas: {len(err)}")
+    for e in err:
+        print(f"    DET  {e}")
+    if not err:
+        print("    (ninguna)")
+    if pwd:
+        print(f"  Titulares con contrasena incorrecta: {len(pwd)}")
+        for e in pwd:
+            print(f"    PWD  {e}")
+    print(
+        f"  Totales: {len(ok)} ok | {len(ya)} ya invitados | {len(err)} detalle"
+    )
+    print(bar)
 
 
 def _miembros_a_invitar(sesion: dict) -> list[str]:
@@ -1677,12 +1902,17 @@ def _pulsar_si_continuar_auth_uia(wnd, timeout_s: float = 6.0) -> bool:
     return False
 
 
-def _invitar_miembro_uia(wnd, email_miembro: str) -> bool:
-    """Ejecuta el flujo UIA para invitar a un miembro al plan familiar en account.tidal.com/family."""
+def _invitar_miembro_uia(wnd, email_miembro: str) -> tuple[str, str]:
+    """Flujo UIA para invitar. Devuelve ('ok'|'ya_invitado'|'error', detalle)."""
     try:
         email_miembro = email_miembro.strip()
         if not email_miembro:
-            return False
+            return "error", "correo vacio"
+
+        previo = estado_invitacion_previa_uia(wnd, email_miembro)
+        if previo:
+            print(f"      Ya en el plan ({previo}): {email_miembro}. No se reenvia.")
+            return "ya_invitado", previo
 
         # 1. Buscar el campo de texto para escribir el correo
         edit_correo = None
@@ -1718,7 +1948,7 @@ def _invitar_miembro_uia(wnd, email_miembro: str) -> bool:
 
         if not edit_correo:
             print("      ⚠️ No se encontró el campo de correo para invitar.")
-            return False
+            return "error", "sin campo de correo"
 
         print(f"      Escribiendo correo: {email_miembro}")
         edit_correo.click_input()
@@ -1747,7 +1977,7 @@ def _invitar_miembro_uia(wnd, email_miembro: str) -> bool:
 
         if not btn_invitar:
             print("      ⚠️ No se encontró el botón 'Invitar'.")
-            return False
+            return "error", "sin boton Invitar"
 
         # Verificar si el botón está habilitado
         try:
@@ -1757,13 +1987,19 @@ def _invitar_miembro_uia(wnd, email_miembro: str) -> bool:
 
         if not enabled:
             print("      ⚠️ El botón 'Invitar' está deshabilitado. ¿El correo es inválido o el plan está lleno?")
-            return False
+            post = estado_invitacion_previa_uia(wnd, email_miembro)
+            if post:
+                return "ya_invitado", post
+            return "error", "boton Invitar deshabilitado"
 
         print("      Pulsando 'Invitar'...")
         btn_invitar.click_input()
         time.sleep(2.5)
-        
-        # Verificar si se vació el input o si hay mensaje de éxito
+
+        post = estado_invitacion_previa_uia(wnd, email_miembro)
+        if post:
+            return "ok", post
+
         success = True
         try:
             val = edit_correo.window_text() or ""
@@ -1773,11 +2009,13 @@ def _invitar_miembro_uia(wnd, email_miembro: str) -> bool:
         except Exception:
             pass
 
-        return success
+        if success:
+            return "ok", "invitacion enviada"
+        return "error", "el correo sigue en el formulario"
 
     except Exception as e:
         print(f"      Error en invitación UIA: {e}")
-        return False
+        return "error", str(e)
 
 
 def _pw_error_types():
@@ -2760,7 +2998,13 @@ def invitar_miembro_plan_familiar_tid(
     except PWErr:
         return False
 
-    # Aceptamos cookies si aparecen de nuevo
+    if not _esta_en_pagina_familia(page):
+        print(
+            "    [Invitar] Abortado: esta ventana no esta en Familia "
+            "(sigue en login / authorize). No se escribe el correo del miembro "
+            "en el formulario de inicio de sesion del titular."
+        )
+        return False
     try:
         aceptar_cookies_con_espera(page, intentos=2, pausa_s=0.1)
     except Exception:
@@ -2849,7 +3093,20 @@ def invitar_miembro_plan_familiar_tid(
         print("    [Invitar] Error al escribir el correo.")
         return False
 
-    time.sleep(pausa_s)
+    # TIDAL habilita «Invitar» tras input/change/blur, no al instante.
+    try:
+        input_loc.dispatch_event("input")
+        input_loc.dispatch_event("change")
+    except Exception:
+        pass
+    try:
+        input_loc.press("Tab")
+    except Exception:
+        try:
+            input_loc.blur()
+        except Exception:
+            pass
+    time.sleep(max(0.6, pausa_s))
 
     # 3) Encontrar el botón "Invitar" / "Invite"
     nombres_boton_invitar = (
@@ -2888,17 +3145,38 @@ def invitar_miembro_plan_familiar_tid(
         print("    [Invitar] Error: No se encontró el botón de enviar invitación.")
         return False
 
-    # Esperar a que el botón se habilite
-    try:
-        button_loc.wait_for_element_state("enabled", timeout=3000)
-    except Exception:
-        print("    [Invitar] Aviso: El botón 'Invitar' no parece estar habilitado.")
+    # Esperar a que el botón se habilite (Locator no tiene wait_for_element_state).
+    boton_habilitado = False
+    deadline_btn = time.monotonic() + 5.0
+    while time.monotonic() < deadline_btn:
+        try:
+            if button_loc.is_visible() and button_loc.is_enabled():
+                boton_habilitado = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+    if not boton_habilitado:
+        print(
+            "    [Invitar] Aviso: is_enabled() no confirmo el boton; "
+            "se pulsa igual si esta visible en Familia."
+        )
+        try:
+            if not button_loc.is_visible():
+                print("    [Invitar] El boton Invitar no esta visible.")
+                return False
+        except Exception:
+            return False
 
     # 4) Pulsar el botón
     print("    [Invitar] Pulsando botón de enviar...")
     if not hacer_clic_humanizado(page, button_loc):
-        print("    [Invitar] Error al hacer clic en el botón de enviar.")
-        return False
+        try:
+            button_loc.click(timeout=4000, force=True)
+        except Exception:
+            print("    [Invitar] Error al hacer clic en el botón de enviar.")
+            return False
 
     time.sleep(pausa_s + 0.5)
 
@@ -2923,9 +3201,14 @@ def invitar_miembro_plan_familiar_tid(
         try:
             val = input_loc.input_value(timeout=500)
             if not val or val.strip() == "":
+                if not _esta_en_pagina_familia(page):
+                    print("    [Invitar] El campo se vacio pero la ventana no esta en Familia. No cuenta como invitacion.")
+                    return False
                 print("    [Invitar] Confirmado: El campo se ha vaciado.")
                 return True
         except Exception:
+            if not _esta_en_pagina_familia(page):
+                return False
             return True
 
         for frame in _frames_visibles(page):
@@ -2948,7 +3231,35 @@ def invitar_miembro_plan_familiar_tid(
                     continue
         time.sleep(0.3)
 
+    if not _esta_en_pagina_familia(page):
+        print("    [Invitar] No se confirmo la invitacion: la ventana no esta en Familia.")
+        return False
     return True
+
+
+def _es_invitacion_pendiente(estado: str) -> bool:
+    e = (estado or "").lower()
+    return "pendiente" in e or "pending" in e
+
+
+def _cancelar_invitacion_pendiente(page, email_objetivo: str) -> bool:
+    """Quita la fila pendiente de ESTE correo para poder enviar un mail nuevo."""
+    try:
+        from abrir_links_chrome_sinantibot import eliminar_miembro_plan_familiar_tid
+    except ImportError:
+        return False
+    print(
+        f"    [Invitar] {email_objetivo} está en Activación pendiente "
+        f"sin correo nuevo. Se cancela y se invita otra vez."
+    )
+    if not eliminar_miembro_plan_familiar_tid(page, email_objetivo):
+        return False
+    try:
+        page.goto(DEFAULT_TIDAL_FAMILY_URL, wait_until="domcontentloaded", timeout=25_000)
+    except Exception:
+        pass
+    time.sleep(0.8)
+    return estado_invitacion_previa(page, email_objetivo) is None
 
 
 def invitar_miembro_plan_familiar_con_reintentos(
@@ -2956,12 +3267,54 @@ def invitar_miembro_plan_familiar_con_reintentos(
     email_objetivo: str,
     intentos: int = 2,
     pausa_s: float = 0.45,
-) -> bool:
+    *,
+    reinvitar_si_pendiente: bool = False,
+) -> tuple[str, str]:
+    """
+    Intenta invitar. Devuelve (codigo, detalle) donde codigo es
+    'ok', 'ya_invitado' o 'error'.
+    «Activa» no se reenvía. «Activación pendiente» se cancela y se reenvía
+    cuando reinvitar_si_pendiente es verdadero: esa fila no manda otro mail.
+    """
+    email_objetivo = (email_objetivo or "").strip()
+    if not email_objetivo:
+        return "error", "correo vacio"
+    if not _esta_en_pagina_familia(page):
+        print(
+            "    [Invitar] Titular no logueado (sigue en login). "
+            "No se invita para no pisar el correo del titular."
+        )
+        return "error", "titular no logueado (sigue en login)"
+    reenvio = False
+    previo = estado_invitacion_previa(page, email_objetivo)
+    if previo and _es_invitacion_pendiente(previo) and reinvitar_si_pendiente:
+        if not _cancelar_invitacion_pendiente(page, email_objetivo):
+            return "error", "no se pudo cancelar la invitación pendiente"
+        previo = None
+        reenvio = True
+    if previo:
+        print(
+            f"    [Invitar] Ya en el plan ({previo}): {email_objetivo}. No se reenvia."
+        )
+        return "ya_invitado", previo
     for _ in range(max(1, intentos)):
         if invitar_miembro_plan_familiar_tid(page, email_objetivo, pausa_s=pausa_s):
-            return True
+            time.sleep(max(0.5, pausa_s))
+            post = estado_invitacion_previa(page, email_objetivo)
+            if post:
+                print(f"    [Invitar] Confirmado en la lista familiar ({post}).")
+                if reenvio:
+                    return "ok", "reinvitacion enviada"
+                return "ok", post
+            return "ok", "reinvitacion enviada" if reenvio else "invitacion enviada"
+        post = estado_invitacion_previa(page, email_objetivo)
+        if post and not (reinvitar_si_pendiente and _es_invitacion_pendiente(post)):
+            print(
+                f"    [Invitar] El correo ya figura en el plan ({post}). Se omite reenvio."
+            )
+            return "ya_invitado", post
         time.sleep(pausa_s)
-    return False
+    return "error", "no se pudo completar"
 
 
 def _esperar_carga_post_goto_tid(
@@ -3038,15 +3391,17 @@ def comprobar_y_reintentar_ventanas_fallidas(
             url_actual = "Desconocida"
         print(f"   • Ventana [{t['n']}] — {t['perfil']} (URL actual: {url_actual})")
         
-    # Preguntar si se desea intentar re-iniciar sesión
+    # Pipeline: no preguntar. El login se reintenta solo.
     intentar = False
     try:
-        if sys.stdin.isatty():
+        if callable(getattr(cfg_captcha, "on_algo_mal", None)):
+            print("\nPipeline: reintentando login automático en ventanas fallidas...")
+            intentar = True
+        elif sys.stdin.isatty():
             res = input("\n¿Deseas intentar re-iniciar sesión automáticamente en estas ventanas? (si/no): ").strip().lower()
             if res in ("si", "sí", "yes", "s", "y"):
                 intentar = True
         else:
-            # En modo no interactivo, reintentamos automáticamente
             print("\n(Entrada no interactiva: reintentando login automático en ventanas fallidas...)")
             intentar = True
     except EOFError:
@@ -3116,14 +3471,17 @@ def ejecutar_playwright(
     invitar_miembro_reintentos: int = 2,
     invitar_miembro_pausa_s: float = 0.45,
     delay_entre_invitar_miembro: float = 0.25,
+    reinvitar_si_pendiente: bool = False,
     usar_incognito: bool = False,
     ventanas_por_oleada: int = VENTANAS_POR_OLEADA,
     oleadas_entre_ip: int = OLEADAS_ENTRE_CAMBIO_IP,
     cerrar_sin_confirmar: bool = False,
+    on_algo_mal=None,
 ) -> dict:
     resumen = {
         "pwd_incorrecta": [],
         "invitados_ok": [],
+        "ya_invitados": [],
         "errores": [],
         "titulares_ok": [],
         "titulares_fail": [],
@@ -3291,6 +3649,8 @@ def ejecutar_playwright(
                     continue
 
                 cfg_captcha = captcha_tid or CaptchaTidManejoCfg()
+                if on_algo_mal is not None:
+                    cfg_captcha.on_algo_mal = on_algo_mal
 
                 print(
                     "\n  Última pasada de carga en cada pestaña (las primeras suelen haber terminado antes)…"
@@ -3541,6 +3901,10 @@ def ejecutar_playwright(
                     captcha_cfg=cfg_captcha,
                 )
 
+                # Re-login ANTES de invitar: si se invita con la ventana en login,
+                # el script escribe el correo del miembro en el campo de inicio de sesión.
+                comprobar_y_reintentar_ventanas_fallidas(trabajos, url_familia_tidal, cfg_captcha)
+
                 hay_miembros = any(_miembros_a_invitar(t) for t in trabajos)
                 if not omitir_fase_invitar_miembros and hay_miembros:
                     print(
@@ -3548,12 +3912,30 @@ def ejecutar_playwright(
                     )
                     for j, t in enumerate(trabajos):
                         perfil, page, n = t["perfil"], t["page"], t["n"]
-                        if t.get("pwd_incorrecta"):
-                            print(f"  [{n}/{total}] {perfil}: omitido (contraseña incorrecta del titular)")
-                            continue
                         miembros = _miembros_a_invitar(t)
                         if not miembros:
                             print(f"  [{n}/{total}] {perfil}: (sin correos a invitar para este titular)")
+                            continue
+                        if t.get("pwd_incorrecta"):
+                            titular_e = (t.get("email") or perfil or "").strip()
+                            print(f"  [{n}/{total}] {perfil}: omitido (contraseña incorrecta del titular)")
+                            for imiem in miembros:
+                                _anotar_unico(
+                                    resumen["errores"],
+                                    f"{imiem} [titular {titular_e}: contrasena incorrecta]",
+                                )
+                            continue
+                        if not _esta_en_pagina_familia(page):
+                            titular_e = (t.get("email") or perfil or "").strip()
+                            print(
+                                f"  [{n}/{total}] {perfil}: omitido (el titular no inicio sesion; "
+                                f"no se escribe el correo a invitar en el login)"
+                            )
+                            for imiem in miembros:
+                                _anotar_unico(
+                                    resumen["errores"],
+                                    f"{imiem} [titular {titular_e}: no logueado, se evito pisar el login]",
+                                )
                             continue
                         print(
                             f"  [{n}/{total}] {perfil} — {len(miembros)} miembro(s) "
@@ -3563,7 +3945,18 @@ def ejecutar_playwright(
                         try:
                             if page.is_closed():
                                 print("    pestaña cerrada, omitida.")
+                                titular_e = (t.get("email") or "").strip()
+                                for imiem in miembros:
+                                    _anotar_unico(
+                                        resumen["errores"],
+                                        f"{imiem} [pestana cerrada; titular {titular_e}]",
+                                    )
                                 continue
+                            try:
+                                page.wait_for_load_state("domcontentloaded", timeout=8_000)
+                            except Exception:
+                                pass
+                            time.sleep(0.8)
                             for k, imiem in enumerate(miembros, start=1):
                                 print(
                                     f"    ({k}/{len(miembros)}) invitar: {imiem}",
@@ -3586,32 +3979,59 @@ def ejecutar_playwright(
                                         except Exception:
                                             pass
                                     time.sleep(max(0.6, delay_entre_invitar_miembro))
-                                if invitar_miembro_plan_familiar_con_reintentos(
+                                codigo, detalle = invitar_miembro_plan_familiar_con_reintentos(
                                     page,
                                     imiem,
                                     intentos=invitar_miembro_reintentos,
                                     pausa_s=invitar_miembro_pausa_s,
-                                ):
+                                    reinvitar_si_pendiente=reinvitar_si_pendiente,
+                                )
+                                titular_e = (t.get("email") or "").strip()
+                                if codigo == "ya_invitado":
                                     print(
-                                        "      OK: Invitación enviada; "
+                                        f"      YA INVITADO ({detalle}). No se reenvia."
+                                    )
+                                    _anotar_unico(
+                                        resumen["ya_invitados"],
+                                        f"{imiem} [{detalle}] titular {titular_e}",
+                                    )
+                                    _anotar_unico(resumen["titulares_ok"], titular_e)
+                                elif codigo == "ok":
+                                    print(
+                                        "      OK: Invitacion enviada; "
                                         "verifica en TIDAL que el miembro figure como invitado."
                                     )
-                                    if imiem not in resumen["invitados_ok"]:
-                                        resumen["invitados_ok"].append(imiem)
-                                    titular_e = (t.get("email") or "").strip()
-                                    if titular_e and titular_e not in resumen["titulares_ok"]:
-                                        resumen["titulares_ok"].append(titular_e)
+                                    _anotar_unico(
+                                        resumen["invitados_ok"],
+                                        (
+                                            f"{imiem} [reinvitacion enviada] (titular {titular_e})"
+                                            if "reinvit" in (detalle or "").lower() and titular_e
+                                            else f"{imiem} [reinvitacion enviada]"
+                                            if "reinvit" in (detalle or "").lower()
+                                            else f"{imiem} (titular {titular_e})"
+                                            if titular_e
+                                            else imiem
+                                        ),
+                                    )
+                                    _anotar_unico(resumen["titulares_ok"], titular_e)
                                 else:
                                     print(
-                                        "      No se pudo completar la invitación "
-                                        "(¿ya invitado, límite alcanzado?)."
+                                        f"      DETALLE: no se pudo completar ({detalle})."
                                     )
-                                    if imiem not in resumen["errores"]:
-                                        resumen["errores"].append(imiem)
+                                    _anotar_unico(
+                                        resumen["errores"],
+                                        f"{imiem} [{detalle}] titular {titular_e}",
+                                    )
                                 if k < len(miembros) and delay_entre_invitar_miembro > 0:
                                     time.sleep(delay_entre_invitar_miembro)
                         except Exception as e:
                             print(f"    Error: {e}")
+                            titular_e = (t.get("email") or "").strip()
+                            for imiem in miembros:
+                                _anotar_unico(
+                                    resumen["errores"],
+                                    f"{imiem} [error {e}; titular {titular_e}]",
+                                )
                         if j < len(trabajos) - 1 and delay_entre_invitar_miembro > 0:
                             time.sleep(delay_entre_invitar_miembro)
 
@@ -3622,9 +4042,6 @@ def ejecutar_playwright(
                         captcha_cfg=cfg_captcha,
                         reciclar_vpn=False,
                     )
-
-                # Opcional: Barrido final para verificar e intentar loguear las ventanas que fallaron
-                comprobar_y_reintentar_ventanas_fallidas(trabajos, url_familia_tidal, cfg_captcha)
 
                 if es_ultima_oleada:
                     if cerrar_sin_confirmar:
@@ -3670,6 +4087,7 @@ def ejecutar_playwright(
                 browser.close()
             except Exception:
                 pass
+    imprimir_resumen_invitaciones(resumen)
     return resumen
 
 
@@ -4009,6 +4427,14 @@ def main() -> None:
         
         ok = 0
         hwnd_procesados = set()
+        resumen_sub = {
+            "pwd_incorrecta": [],
+            "invitados_ok": [],
+            "ya_invitados": [],
+            "errores": [],
+            "titulares_ok": [],
+            "titulares_fail": [],
+        }
         for i, s in enumerate(sesiones):
             perfil = s["perfil"]
             email = s["email"]
@@ -4301,10 +4727,27 @@ def main() -> None:
                         f"  [Fase 8] ({k}/{len(miembros_titular)}) "
                         f"Invitando miembro al plan familiar: {imiem}"
                     )
-                    if _invitar_miembro_uia(wnd, imiem):
-                        print("  ✅ Invitación enviada correctamente.")
+                    codigo, detalle = _invitar_miembro_uia(wnd, imiem)
+                    if codigo == "ya_invitado":
+                        print(f"  YA INVITADO ({detalle}). No se reenvia.")
+                        _anotar_unico(
+                            resumen_sub["ya_invitados"],
+                            f"{imiem} [{detalle}] titular {email}",
+                        )
+                    elif codigo == "ok":
+                        print("  OK: Invitacion enviada correctamente.")
+                        _anotar_unico(
+                            resumen_sub["invitados_ok"],
+                            f"{imiem} (titular {email})",
+                        )
                     else:
-                        print("  ⚠️ No se pudo invitar al miembro de manera automática. Revisa la ventana.")
+                        print(
+                            f"  DETALLE: no se pudo invitar de manera automatica ({detalle})."
+                        )
+                        _anotar_unico(
+                            resumen_sub["errores"],
+                            f"{imiem} [{detalle}] titular {email}",
+                        )
                     if k < len(miembros_titular):
                         time.sleep(2.0)
 
@@ -4318,6 +4761,7 @@ def main() -> None:
                 time.sleep(args.delay)
 
         print(f"\nResumen: {ok}/{len(sesiones)} procesados en modo subprocess.")
+        imprimir_resumen_invitaciones(resumen_sub)
         return
 
     print(
