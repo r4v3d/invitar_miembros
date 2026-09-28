@@ -1633,39 +1633,109 @@ def _anotar_unico(lista: list, valor: str) -> None:
         lista.append(valor)
 
 
-def imprimir_resumen_invitaciones(resumen: dict) -> None:
-    """Monitoreo final en consola: enviados, ya invitados y detalles."""
-    ok = list(resumen.get("invitados_ok") or [])
-    ya = list(resumen.get("ya_invitados") or [])
-    err = list(resumen.get("errores") or [])
-    pwd = list(resumen.get("pwd_incorrecta") or [])
-    bar = "=" * 62
-    print(f"\n{bar}")
-    print("  RESUMEN FINAL DE INVITACIONES")
-    print(bar)
-    print(f"  Enviadas correctamente: {len(ok)}")
-    for e in ok:
-        print(f"    OK   {e}")
-    if not ok:
-        print("    (ninguna)")
-    print(f"  Ya estaban en el plan (Activa / Activacion pendiente): {len(ya)}")
-    for e in ya:
-        print(f"    YA   {e}")
-    if not ya:
-        print("    (ninguno)")
-    print(f"  Con detalle / no completadas: {len(err)}")
-    for e in err:
-        print(f"    DET  {e}")
-    if not err:
-        print("    (ninguna)")
-    if pwd:
-        print(f"  Titulares con contrasena incorrecta: {len(pwd)}")
-        for e in pwd:
-            print(f"    PWD  {e}")
-    print(
-        f"  Totales: {len(ok)} ok | {len(ya)} ya invitados | {len(err)} detalle"
+def _registrar_resultado_invitacion(
+    resumen: dict,
+    *,
+    n,
+    titular: str,
+    miembro: str,
+    codigo: str,
+    detalle: str = "",
+) -> None:
+    """codigo: ok | ya | fail. Alimenta el resumen final estilo cancelacion."""
+    titular = (titular or "").strip() or "?"
+    miembro = (miembro or "").strip() or "?"
+    detalle = (detalle or "").strip()
+    resumen.setdefault("filas", []).append(
+        {
+            "n": n,
+            "titular": titular,
+            "miembro": miembro,
+            "codigo": codigo,
+            "detalle": detalle,
+        }
     )
-    print(bar)
+    if codigo == "ok":
+        etiqueta = f"{miembro} (titular {titular})"
+        if detalle:
+            etiqueta = f"{miembro} [{detalle}] (titular {titular})"
+        _anotar_unico(resumen["invitados_ok"], etiqueta)
+        _anotar_unico(resumen["titulares_ok"], titular)
+    elif codigo == "ya":
+        _anotar_unico(
+            resumen["ya_invitados"],
+            f"{miembro} [{detalle or 'ya invitado'}] titular {titular}",
+        )
+        _anotar_unico(resumen["titulares_ok"], titular)
+    else:
+        _anotar_unico(
+            resumen["errores"],
+            f"{miembro} [{detalle or 'fallo'}] titular {titular}",
+        )
+
+
+def _imprimir_linea(texto: str) -> None:
+    try:
+        print(texto)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(texto.encode(enc, errors="replace").decode(enc, errors="replace"))
+
+
+def imprimir_resumen_invitaciones(resumen: dict) -> None:
+    """Mismo formato que el resumen de cancelacion: bloques y una linea por resultado."""
+    bar = "=" * 70
+    _imprimir_linea(f"\n{bar}")
+    _imprimir_linea("  RESUMEN FINAL")
+    _imprimir_linea(bar)
+
+    pwd_filas = list(resumen.get("pwd_filas") or [])
+    if not pwd_filas:
+        for email in resumen.get("pwd_incorrecta") or []:
+            pwd_filas.append({"n": "?", "perfil": "", "email": email})
+    _imprimir_linea("\n  Contraseñas incorrectas (cuentas titulares):")
+    if not pwd_filas:
+        _imprimir_linea("    (ninguna detectada)")
+    else:
+        for t in pwd_filas:
+            perfil = (t.get("perfil") or "").strip()
+            email = (t.get("email") or "(sin correo)").strip()
+            extra = f" {perfil}:" if perfil and perfil != email else ""
+            _imprimir_linea(f"    \u2716 [{t.get('n')}]{extra} {email}")
+
+    filas = list(resumen.get("filas") or [])
+    _imprimir_linea("\n  Invitaciones al plan familiar:")
+    if not filas:
+        _imprimir_linea("    (no se intento invitar ningun miembro en esta ejecucion)")
+    else:
+        ok_n = sum(1 for f in filas if f.get("codigo") == "ok")
+        ya_n = sum(1 for f in filas if f.get("codigo") == "ya")
+        fail_n = len(filas) - ok_n - ya_n
+        for f in filas:
+            codigo = f.get("codigo")
+            if codigo == "ok":
+                marca, estado = "\u2713", "OK"
+            elif codigo == "ya":
+                marca, estado = "\u2713", "YA"
+            else:
+                marca, estado = "\u2716", "FALLÓ"
+            miembro = f.get("miembro") or "?"
+            detalle = (f.get("detalle") or "").strip()
+            if codigo == "ok" and not detalle:
+                detalle = "Invitacion enviada"
+            extra = f" \u2014 {miembro}"
+            if detalle:
+                extra += f" ({detalle})"
+            _imprimir_linea(
+                f"    [{marca}] {estado} | [{f.get('n')}] "
+                f"{f.get('titular') or '?'}{extra}"
+            )
+        _imprimir_linea(
+            f"\n    Totales invitación: {ok_n} OK, {ya_n} ya invitados, "
+            f"{fail_n} fallidas, {len(filas)} intentos."
+        )
+
+    _imprimir_linea(f"{bar}\n")
 
 
 def _miembros_a_invitar(sesion: dict) -> list[str]:
@@ -3855,6 +3925,13 @@ def ejecutar_playwright(
                         email_t = (t.get("email") or perfil or "").strip()
                         if email_t and email_t not in resumen["pwd_incorrecta"]:
                             resumen["pwd_incorrecta"].append(email_t)
+                            resumen.setdefault("pwd_filas", []).append(
+                                {
+                                    "n": t.get("n"),
+                                    "perfil": perfil,
+                                    "email": email_t,
+                                }
+                            )
                         print(
                             f"    ✗ Contraseña incorrecta para {email_t or perfil}. "
                             f"No se reintenta; se omite este titular."
@@ -3920,9 +3997,13 @@ def ejecutar_playwright(
                             titular_e = (t.get("email") or perfil or "").strip()
                             print(f"  [{n}/{total}] {perfil}: omitido (contraseña incorrecta del titular)")
                             for imiem in miembros:
-                                _anotar_unico(
-                                    resumen["errores"],
-                                    f"{imiem} [titular {titular_e}: contrasena incorrecta]",
+                                _registrar_resultado_invitacion(
+                                    resumen,
+                                    n=n,
+                                    titular=titular_e,
+                                    miembro=imiem,
+                                    codigo="fail",
+                                    detalle="contrasena incorrecta del titular",
                                 )
                             continue
                         if not _esta_en_pagina_familia(page):
@@ -3932,9 +4013,13 @@ def ejecutar_playwright(
                                 f"no se escribe el correo a invitar en el login)"
                             )
                             for imiem in miembros:
-                                _anotar_unico(
-                                    resumen["errores"],
-                                    f"{imiem} [titular {titular_e}: no logueado, se evito pisar el login]",
+                                _registrar_resultado_invitacion(
+                                    resumen,
+                                    n=n,
+                                    titular=titular_e,
+                                    miembro=imiem,
+                                    codigo="fail",
+                                    detalle="titular no logueado",
                                 )
                             continue
                         print(
@@ -3947,9 +4032,13 @@ def ejecutar_playwright(
                                 print("    pestaña cerrada, omitida.")
                                 titular_e = (t.get("email") or "").strip()
                                 for imiem in miembros:
-                                    _anotar_unico(
-                                        resumen["errores"],
-                                        f"{imiem} [pestana cerrada; titular {titular_e}]",
+                                    _registrar_resultado_invitacion(
+                                        resumen,
+                                        n=n,
+                                        titular=titular_e,
+                                        miembro=imiem,
+                                        codigo="fail",
+                                        detalle="pestana cerrada",
                                     )
                                 continue
                             try:
@@ -3991,36 +4080,38 @@ def ejecutar_playwright(
                                     print(
                                         f"      YA INVITADO ({detalle}). No se reenvia."
                                     )
-                                    _anotar_unico(
-                                        resumen["ya_invitados"],
-                                        f"{imiem} [{detalle}] titular {titular_e}",
+                                    _registrar_resultado_invitacion(
+                                        resumen,
+                                        n=n,
+                                        titular=titular_e,
+                                        miembro=imiem,
+                                        codigo="ya",
+                                        detalle=detalle,
                                     )
-                                    _anotar_unico(resumen["titulares_ok"], titular_e)
                                 elif codigo == "ok":
                                     print(
                                         "      OK: Invitacion enviada; "
                                         "verifica en TIDAL que el miembro figure como invitado."
                                     )
-                                    _anotar_unico(
-                                        resumen["invitados_ok"],
-                                        (
-                                            f"{imiem} [reinvitacion enviada] (titular {titular_e})"
-                                            if "reinvit" in (detalle or "").lower() and titular_e
-                                            else f"{imiem} [reinvitacion enviada]"
-                                            if "reinvit" in (detalle or "").lower()
-                                            else f"{imiem} (titular {titular_e})"
-                                            if titular_e
-                                            else imiem
-                                        ),
+                                    _registrar_resultado_invitacion(
+                                        resumen,
+                                        n=n,
+                                        titular=titular_e,
+                                        miembro=imiem,
+                                        codigo="ok",
+                                        detalle=detalle or "Invitacion enviada",
                                     )
-                                    _anotar_unico(resumen["titulares_ok"], titular_e)
                                 else:
                                     print(
                                         f"      DETALLE: no se pudo completar ({detalle})."
                                     )
-                                    _anotar_unico(
-                                        resumen["errores"],
-                                        f"{imiem} [{detalle}] titular {titular_e}",
+                                    _registrar_resultado_invitacion(
+                                        resumen,
+                                        n=n,
+                                        titular=titular_e,
+                                        miembro=imiem,
+                                        codigo="fail",
+                                        detalle=detalle or "no se pudo completar",
                                     )
                                 if k < len(miembros) and delay_entre_invitar_miembro > 0:
                                     time.sleep(delay_entre_invitar_miembro)
@@ -4028,9 +4119,13 @@ def ejecutar_playwright(
                             print(f"    Error: {e}")
                             titular_e = (t.get("email") or "").strip()
                             for imiem in miembros:
-                                _anotar_unico(
-                                    resumen["errores"],
-                                    f"{imiem} [error {e}; titular {titular_e}]",
+                                _registrar_resultado_invitacion(
+                                    resumen,
+                                    n=n,
+                                    titular=titular_e,
+                                    miembro=imiem,
+                                    codigo="fail",
+                                    detalle=str(e),
                                 )
                         if j < len(trabajos) - 1 and delay_entre_invitar_miembro > 0:
                             time.sleep(delay_entre_invitar_miembro)
@@ -4730,23 +4825,35 @@ def main() -> None:
                     codigo, detalle = _invitar_miembro_uia(wnd, imiem)
                     if codigo == "ya_invitado":
                         print(f"  YA INVITADO ({detalle}). No se reenvia.")
-                        _anotar_unico(
-                            resumen_sub["ya_invitados"],
-                            f"{imiem} [{detalle}] titular {email}",
+                        _registrar_resultado_invitacion(
+                            resumen_sub,
+                            n=i + 1,
+                            titular=email,
+                            miembro=imiem,
+                            codigo="ya",
+                            detalle=detalle,
                         )
                     elif codigo == "ok":
                         print("  OK: Invitacion enviada correctamente.")
-                        _anotar_unico(
-                            resumen_sub["invitados_ok"],
-                            f"{imiem} (titular {email})",
+                        _registrar_resultado_invitacion(
+                            resumen_sub,
+                            n=i + 1,
+                            titular=email,
+                            miembro=imiem,
+                            codigo="ok",
+                            detalle=detalle or "Invitacion enviada",
                         )
                     else:
                         print(
                             f"  DETALLE: no se pudo invitar de manera automatica ({detalle})."
                         )
-                        _anotar_unico(
-                            resumen_sub["errores"],
-                            f"{imiem} [{detalle}] titular {email}",
+                        _registrar_resultado_invitacion(
+                            resumen_sub,
+                            n=i + 1,
+                            titular=email,
+                            miembro=imiem,
+                            codigo="fail",
+                            detalle=detalle or "no se pudo completar",
                         )
                     if k < len(miembros_titular):
                         time.sleep(2.0)
